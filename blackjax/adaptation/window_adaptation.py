@@ -28,12 +28,19 @@ from blackjax.adaptation.step_size import (
     DualAveragingAdaptationState,
     dual_averaging_adaptation,
 )
-from blackjax.base import AdaptationAlgorithm
+from blackjax.base import AdaptationAlgorithm, ChunkedAdaptationAlgorithm
 from blackjax.progress_bar import gen_scan_fn
 from blackjax.types import Array, ArrayLikeTree, PRNGKey
 from blackjax.util import pytree_size
 
-__all__ = ["WindowAdaptationState", "base", "build_schedule", "window_adaptation"]
+__all__ = [
+    "WindowAdaptationState",
+    "WindowWarmupState",
+    "base",
+    "build_schedule",
+    "chunked_window_adaptation",
+    "window_adaptation",
+]
 
 
 class WindowAdaptationState(NamedTuple):
@@ -41,6 +48,15 @@ class WindowAdaptationState(NamedTuple):
     imm_state: MassMatrixAdaptationState  # inverse mass matrix
     step_size: float
     inverse_mass_matrix: Array
+
+
+class WindowWarmupState(NamedTuple):
+    """State of a chunked window adaptation: the chain, the adaptation and the
+    number of warmup steps done."""
+
+    state: ArrayLikeTree
+    adaptation_state: WindowAdaptationState
+    step: Array
 
 
 def base(
@@ -355,6 +371,66 @@ def window_adaptation(
     A function that runs the adaptation and returns an `AdaptationResult` object.
 
     """
+    chunked = chunked_window_adaptation(
+        algorithm,
+        logdensity_fn,
+        is_mass_matrix_diagonal=is_mass_matrix_diagonal,
+        initial_inverse_mass_matrix=initial_inverse_mass_matrix,
+        imm_shrinkage_to_previous=imm_shrinkage_to_previous,
+        initial_step_size=initial_step_size,
+        target_acceptance_rate=target_acceptance_rate,
+        progress_bar=progress_bar,
+        print_rate=print_rate,
+        adaptation_info_fn=adaptation_info_fn,
+        integrator=integrator,
+        **extra_parameters,
+    )
+
+    def run(rng_key: PRNGKey, position: ArrayLikeTree, num_steps: int = 1000):
+        if progress_bar:
+            print("Running window adaptation")
+        warmup_state, info = chunked.run_chunk(
+            chunked.init(position), rng_key, num_steps, num_steps
+        )
+        return chunked.final(warmup_state), info
+
+    return AdaptationAlgorithm(run)
+
+
+def chunked_window_adaptation(
+    algorithm,
+    logdensity_fn: Callable,
+    is_mass_matrix_diagonal: bool = True,
+    initial_inverse_mass_matrix: Array | None = None,
+    imm_shrinkage_to_previous: float = 0.0,
+    initial_step_size: float = 1.0,
+    target_acceptance_rate: float = 0.80,
+    progress_bar: bool = False,
+    print_rate: int | None = None,
+    adaptation_info_fn: Callable = return_all_adapt_info,
+    integrator=mcmc.integrators.velocity_verlet,
+    **extra_parameters,
+) -> ChunkedAdaptationAlgorithm:
+    """Window adaptation split into resumable chunks.
+
+    Takes the same arguments as :func:`window_adaptation` and returns a
+    :class:`~blackjax.base.ChunkedAdaptationAlgorithm`:
+
+    * ``init(position)`` returns a :class:`WindowWarmupState` at step 0;
+    * ``run_chunk(warmup_state, rng_key, num_steps, length)`` runs the next
+      ``length`` of the ``num_steps`` warmup steps and returns the new warmup
+      state and the per-step adaptation info;
+    * ``final(warmup_state)`` returns the ``AdaptationResults``.
+
+    The random keys (``jax.random.split(rng_key, num_steps)``) and the schedule
+    (``build_schedule(num_steps)``) are those of the whole warmup, sliced at the
+    current step, so any sequence of chunks covering ``num_steps`` steps gives
+    the same result as ``window_adaptation(...).run(rng_key, position,
+    num_steps)``. The warmup state is a pytree of arrays and can be saved
+    between chunks to resume an interrupted warmup. Chunks of equal ``length``
+    share one compiled program under ``jax.jit`` with ``num_steps`` and
+    ``length`` static.
+    """
     # Validate initial_inverse_mass_matrix shape against is_mass_matrix_diagonal.
     # Do this BEFORE any JIT-traced path so the user gets a clear Python error.
     if initial_inverse_mass_matrix is not None:
@@ -416,42 +492,41 @@ def window_adaptation(
             adaptation_info_fn(new_state, info, new_adaptation_state),
         )
 
-    def run(rng_key: PRNGKey, position: ArrayLikeTree, num_steps: int = 1000):
-        init_state = algorithm.init(position, logdensity_fn)
-        init_adaptation_state = adapt_init(position, initial_step_size)
-
-        if progress_bar:
-            print("Running window adaptation")
-        scan_fn = gen_scan_fn(
-            num_steps, progress_bar=progress_bar, print_rate=print_rate
+    def init(position: ArrayLikeTree) -> WindowWarmupState:
+        return WindowWarmupState(
+            algorithm.init(position, logdensity_fn),
+            adapt_init(position, initial_step_size),
+            jnp.asarray(0, dtype=jnp.int32),
         )
-        start_state = (init_state, init_adaptation_state)
+
+    def run_chunk(
+        warmup_state: WindowWarmupState, rng_key: PRNGKey, num_steps: int, length: int
+    ):
+        start = warmup_state.step
         keys = jax.random.split(rng_key, num_steps)
         schedule = build_schedule(num_steps)
-        last_state, info = scan_fn(
+        scan_fn = gen_scan_fn(length, progress_bar=progress_bar, print_rate=print_rate)
+        (state, adaptation_state), info = scan_fn(
             one_step,
-            start_state,
-            (jnp.arange(num_steps), keys, schedule),
+            (warmup_state.state, warmup_state.adaptation_state),
+            (
+                jnp.arange(length),
+                jax.lax.dynamic_slice_in_dim(keys, start, length),
+                jax.lax.dynamic_slice_in_dim(schedule, start, length),
+            ),
         )
+        return WindowWarmupState(state, adaptation_state, start + length), info
 
-        last_chain_state, last_warmup_state, *_ = last_state
-
-        step_size, inverse_mass_matrix = adapt_final(last_warmup_state)
+    def final(warmup_state: WindowWarmupState) -> AdaptationResults:
+        step_size, inverse_mass_matrix = adapt_final(warmup_state.adaptation_state)
         parameters = {
             "step_size": step_size,
             "inverse_mass_matrix": inverse_mass_matrix,
             **extra_parameters,
         }
+        return AdaptationResults(warmup_state.state, parameters)
 
-        return (
-            AdaptationResults(
-                last_chain_state,
-                parameters,
-            ),
-            info,
-        )
-
-    return AdaptationAlgorithm(run)
+    return ChunkedAdaptationAlgorithm(init, run_chunk, final)
 
 
 def build_schedule(

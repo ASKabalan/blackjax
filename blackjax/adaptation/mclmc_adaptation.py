@@ -13,7 +13,7 @@
 # limitations under the License.
 """Algorithms to adapt the MCLMC kernel parameters, namely step size and L."""
 
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -21,6 +21,7 @@ from jax.flatten_util import ravel_pytree
 
 from blackjax.diagnostics import effective_sample_size
 from blackjax.progress_bar import gen_scan_fn
+from blackjax.types import Array, ArrayLikeTree
 from blackjax.util import generate_unit_vector, incremental_value_update, pytree_size
 
 
@@ -178,20 +179,271 @@ def mclmc_find_L_and_step_size(
     return state, params, total_num_tuning_integrator_steps
 
 
-def make_L_step_size_adaptation(
+class MCLMCTuningState(NamedTuple):
+    """State of a chunked MCLMC tuning.
+
+    step
+        Number of tuning steps done, over the three stages.
+    state
+        The MCLMC chain state.
+    params
+        The current ``MCLMCAdaptationState``.
+    adaptive_state
+        ``(time, x_average, step_size_max)`` of the step-size adaptation.
+    streaming_avg
+        ``(weight, [E[x], E[x^2]])`` of the posterior-size estimate.
+    samples
+        Flattened positions of the L stage, one row per step.
+    """
+
+    step: Array
+    state: ArrayLikeTree
+    params: MCLMCAdaptationState
+    adaptive_state: tuple
+    streaming_avg: tuple
+    samples: Array
+
+
+class ChunkedMCLMCAdaptation(NamedTuple):
+    """``init``, ``run_chunk`` and ``final`` of a chunked MCLMC tuning, and
+    ``num_steps``, the total number of tuning steps over its stages."""
+
+    init: Callable
+    run_chunk: Callable
+    final: Callable
+    num_steps: int
+
+
+def chunked_mclmc_find_L_and_step_size(
+    mclmc_kernel,
+    num_steps,
+    rng_key,
+    logdensity_fn=None,
+    frac_tune1=0.1,
+    frac_tune2=0.1,
+    frac_tune3=0.1,
+    desired_energy_var=5e-4,
+    trust_in_estimate=1.5,
+    num_effective_samples=150,
+    diagonal_preconditioning=True,
+    l_factor=0.4,
+):
+    """:func:`mclmc_find_L_and_step_size` split into resumable chunks.
+
+    Takes the arguments of :func:`mclmc_find_L_and_step_size` except the initial
+    state and parameters, which go to ``init``, and returns a
+    :class:`ChunkedMCLMCAdaptation`:
+
+    * ``init(state, params=None)`` returns a :class:`MCLMCTuningState` at step 0;
+    * ``run_chunk(tuning_state, length)`` runs the next ``length`` tuning steps,
+      crossing from one stage to the next when needed;
+    * ``final(tuning_state)`` returns ``(state, params, num_tuning_steps)`` as
+      :func:`mclmc_find_L_and_step_size` does;
+    * ``num_steps`` is the number of tuning steps over the stages: the
+      step-size and posterior-size stage, the step-size readjustment after a
+      diagonal preconditioning, and the L stage.
+
+    The random keys are those of :func:`mclmc_find_L_and_step_size`, sliced at
+    the current step, so chunks covering ``num_steps`` steps give the same
+    result as the one-call tuning. ``run_chunk`` is driven from Python: it reads
+    ``tuning_state.step`` and calls one compiled scan per stage and chunk length,
+    so it must not itself be jitted. The tuning state is a pytree of arrays and
+    can be saved between chunks to resume an interrupted tuning; it holds the
+    L-stage positions, ``round(num_steps * frac_tune3)`` rows of the dimension.
+    """
+    if logdensity_fn is None:
+        raise ValueError(
+            "logdensity_fn is required. Pass the log-density function of the "
+            "target distribution."
+        )
+
+    part1_key, part2_key = jax.random.split(rng_key, 2)
+    num_steps1, num_steps2 = round(num_steps * frac_tune1), round(
+        num_steps * frac_tune2
+    )
+    num_steps3 = round(num_steps * frac_tune3)
+    # stage 1: step size and posterior size (make_L_step_size_adaptation)
+    tune_keys = jax.random.split(part1_key, num_steps1 + num_steps2 + 1)
+    tune_keys, final_key = tune_keys[:-1], tune_keys[-1]
+    tune_mask = jnp.concatenate((jnp.zeros(num_steps1), jnp.ones(num_steps2)))
+    # stage 2: step-size readjustment after the diagonal preconditioning
+    readjust_steps = (
+        round(num_steps2 / 3) if diagonal_preconditioning and num_steps2 > 1 else 0
+    )
+    readjust_keys = jax.random.split(final_key, readjust_steps)
+    # stage 3: L from the autocorrelation (make_adaptation_L)
+    l_steps = num_steps3 if num_steps3 >= 2 else 0
+    l_keys = jax.random.split(part2_key, num_steps3)
+    stages = (
+        ("tune", num_steps1 + num_steps2),
+        ("readjust", readjust_steps),
+        ("L", l_steps),
+    )
+    total_steps = sum(length for _, length in stages)
+    # as counted by mclmc_find_L_and_step_size
+    num_tuning_integrator_steps = (
+        num_steps1
+        + num_steps2
+        + diagonal_preconditioning * (num_steps2 // 3)
+        + (num_steps3 if num_steps3 >= 2 else 0)
+    )
+
+    def initial_averages(dim):
+        return (0.0, 0.0, jnp.inf), (0.0, jnp.array([jnp.zeros(dim), jnp.zeros(dim)]))
+
+    def init(state, params=None):
+        flat_position = ravel_pytree(state.position)[0]
+        dim = flat_position.shape[0]
+        if params is None:
+            params = MCLMCAdaptationState(
+                jnp.sqrt(dim), jnp.sqrt(dim) * 0.25, inverse_mass_matrix=jnp.ones((dim,))
+            )
+        adaptive_state, streaming_avg = initial_averages(dim)
+        return MCLMCTuningState(
+            jnp.asarray(0, dtype=jnp.int32),
+            state,
+            params,
+            jax.tree.map(jnp.asarray, adaptive_state),
+            jax.tree.map(jnp.asarray, streaming_avg),
+            jnp.zeros((l_steps, dim), dtype=flat_position.dtype),
+        )
+
+    compiled = {}
+
+    def stage_scan(name, dim, length):
+        # one compiled scan per stage and chunk length
+        if (name, length) in compiled:
+            return compiled[(name, length)]
+        if name == "L":
+
+            def l_step(state, step_input):
+                params, key = step_input
+                next_state, _ = mclmc_kernel(
+                    rng_key=key,
+                    state=state,
+                    logdensity_fn=logdensity_fn,
+                    inverse_mass_matrix=params.inverse_mass_matrix,
+                    L=params.L,
+                    step_size=params.step_size,
+                )
+                return next_state, ravel_pytree(next_state.position)[0]
+
+            def run(tuning_state, offset):
+                keys = jax.lax.dynamic_slice_in_dim(l_keys, offset, length)
+                params = tuning_state.params
+                state, positions = jax.lax.scan(
+                    lambda s, k: l_step(s, (params, k)), tuning_state.state, keys
+                )
+                samples = jax.lax.dynamic_update_slice_in_dim(
+                    tuning_state.samples, positions, offset, axis=0
+                )
+                return tuning_state._replace(state=state, samples=samples)
+
+        else:
+            step = _make_tuning_step(
+                mclmc_kernel,
+                logdensity_fn,
+                dim,
+                desired_energy_var,
+                trust_in_estimate,
+                num_effective_samples,
+            )
+            keys_all, mask_all = (
+                (tune_keys, tune_mask)
+                if name == "tune"
+                else (readjust_keys, jnp.ones(readjust_steps))
+            )
+
+            def run(tuning_state, offset):
+                xs = (
+                    jnp.arange(length),
+                    jax.lax.dynamic_slice_in_dim(mask_all, offset, length),
+                    jax.lax.dynamic_slice_in_dim(keys_all, offset, length),
+                )
+                carry = (
+                    tuning_state.state,
+                    tuning_state.params,
+                    tuning_state.adaptive_state,
+                    tuning_state.streaming_avg,
+                )
+                (state, params, adaptive_state, streaming_avg), _ = jax.lax.scan(
+                    step, carry, xs
+                )
+                return tuning_state._replace(
+                    state=state,
+                    params=params,
+                    adaptive_state=adaptive_state,
+                    streaming_avg=streaming_avg,
+                )
+
+        compiled[(name, length)] = jax.jit(run)
+        return compiled[(name, length)]
+
+    def end_of_stage(name, tuning_state, dim):
+        # what mclmc_find_L_and_step_size does between its scans
+        params = tuning_state.params
+        if name == "tune":
+            if num_steps2 > 1:
+                average = tuning_state.streaming_avg[1]
+                variances = average[1] - jnp.square(average[0])
+                if diagonal_preconditioning:
+                    # the readjustment runs with the new mass matrix and the old L
+                    params = params._replace(inverse_mass_matrix=variances)
+                    adaptive_state, streaming_avg = initial_averages(dim)
+                    return tuning_state._replace(
+                        params=params,
+                        adaptive_state=jax.tree.map(jnp.asarray, adaptive_state),
+                        streaming_avg=jax.tree.map(jnp.asarray, streaming_avg),
+                    )
+                params = params._replace(L=jnp.sqrt(jnp.sum(variances)))
+        elif name == "readjust":
+            params = params._replace(L=jnp.sqrt(dim))
+        else:
+            ess = effective_sample_size(tuning_state.samples[None, ...])
+            params = params._replace(
+                L=l_factor * params.step_size * jnp.mean(l_steps / ess)
+            )
+        return tuning_state._replace(params=params)
+
+    def run_chunk(tuning_state, length):
+        dim = tuning_state.samples.shape[1]
+        step = int(tuning_state.step)
+        end = min(step + length, total_steps)
+        while step < end:
+            stage_start = 0
+            for name, stage_length in stages:
+                if step < stage_start + stage_length:
+                    break
+                stage_start += stage_length
+            offset = step - stage_start
+            n = min(end, stage_start + stage_length) - step
+            tuning_state = stage_scan(name, dim, n)(tuning_state, offset)
+            step += n
+            if step == stage_start + stage_length:
+                tuning_state = end_of_stage(name, tuning_state, dim)
+            tuning_state = tuning_state._replace(step=jnp.asarray(step, dtype=jnp.int32))
+        return tuning_state
+
+    def final(tuning_state):
+        if int(tuning_state.step) != total_steps:
+            raise ValueError(
+                f"The tuning is at step {int(tuning_state.step)} of {total_steps}."
+            )
+        return tuning_state.state, tuning_state.params, num_tuning_integrator_steps
+
+    return ChunkedMCLMCAdaptation(init, run_chunk, final, total_steps)
+
+
+def _make_tuning_step(
     kernel,
     logdensity_fn,
     dim,
-    frac_tune1,
-    frac_tune2,
-    diagonal_preconditioning,
-    desired_energy_var=1e-3,
-    trust_in_estimate=1.5,
-    num_effective_samples=150,
-    progress_bar=False,
-    print_rate=None,
+    desired_energy_var,
+    trust_in_estimate,
+    num_effective_samples,
 ):
-    """Adapts the stepsize and L of the MCLMC kernel. Designed for unadjusted MCLMC"""
+    """One step of the step-size and posterior-size stage of the MCLMC tuning:
+    ``step((state, params, adaptive_state, streaming_avg), (_, mask, rng_key))``."""
 
     decay_rate = (num_effective_samples - 1.0) / (num_effective_samples + 1.0)
 
@@ -271,6 +523,33 @@ def make_L_step_size_adaptation(
         )
 
         return (state, params, adaptive_state, streaming_avg), None
+
+    return step
+
+
+def make_L_step_size_adaptation(
+    kernel,
+    logdensity_fn,
+    dim,
+    frac_tune1,
+    frac_tune2,
+    diagonal_preconditioning,
+    desired_energy_var=1e-3,
+    trust_in_estimate=1.5,
+    num_effective_samples=150,
+    progress_bar=False,
+    print_rate=None,
+):
+    """Adapts the stepsize and L of the MCLMC kernel. Designed for unadjusted MCLMC"""
+
+    step = _make_tuning_step(
+        kernel,
+        logdensity_fn,
+        dim,
+        desired_energy_var,
+        trust_in_estimate,
+        num_effective_samples,
+    )
 
     # NEW: Redefine run_steps to take `length` and use `gen_scan_fn`
     def run_steps(xs, state, params, length):

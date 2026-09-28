@@ -151,6 +151,21 @@ class AdaptationAlgorithm(NamedTuple):
     run: RunFn
 
 
+class ChunkedAdaptationAlgorithm(NamedTuple):
+    """An adaptation algorithm split into resumable chunks.
+
+    ``init`` builds the warmup state, ``run_chunk`` advances it by a given number
+    of steps and ``final`` turns it into the adapted state and parameters. The
+    warmup state is a pytree of arrays, so it can be checkpointed between chunks;
+    running the chunks back to back gives the same result as the one-call
+    adaptation.
+    """
+
+    init: Callable
+    run_chunk: Callable
+    final: Callable
+
+
 def build_sampling_algorithm(
     kernel: Callable,
     init_state: Callable,
